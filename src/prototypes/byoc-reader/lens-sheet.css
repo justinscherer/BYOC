@@ -1,0 +1,42 @@
+/* Shared layout for the three lens sheet bodies (article, image, fact check). */
+
+.byoc-lens > * + * {
+  margin-top: var(--spacing-75);
+}
+
+.byoc-lens__kicker {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-50);
+  margin: 0;
+  color: var(--color-subtle);
+}
+
+.byoc-lens__kicker .cdx-icon {
+  color: var(--color-subtle);
+}
+
+.byoc-lens__passage {
+  margin-inline: 0;
+  padding-inline-start: var(--spacing-75);
+  border-inline-start: var(--border-width-thick) solid var(--border-color-subtle);
+  color: var(--color-subtle);
+}
+
+.byoc-lens__title {
+  margin-bottom: 0;
+}
+
+.byoc-lens__desc {
+  margin-top: 0;
+  color: var(--color-subtle);
+}
+
+.byoc-lens__cta {
+  clear: both;
+  margin-top: var(--spacing-100);
+}
+
+.byoc-lens__footnote {
+  color: var(--color-subtle);
+}
