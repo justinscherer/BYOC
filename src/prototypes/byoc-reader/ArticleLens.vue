@@ -1,78 +1,77 @@
 <script setup lang="ts">
-import { ref, watchEffect } from 'vue'
-import { CdxButton, CdxIcon, CdxProgressBar } from '@wikimedia/codex'
-import { cdxIconLinkExternal, cdxIconLogoWikipedia } from '@wikimedia/codex-icons'
+/**
+ * The full Wikipedia article, rendered in-sheet with the shared in-app
+ * article surface. Wiki links are intercepted and reported via `navigate`, so
+ * the sheet keeps its own browsing history instead of leaving the reader;
+ * non-wiki links open in a new tab.
+ */
+import { computed, provide } from 'vue'
+import { CdxIcon } from '@wikimedia/codex'
+import { cdxIconLogoWikipedia } from '@wikimedia/codex-icons'
+
+import ArticleLive from '@/components/article/ArticleLive.vue'
+import {
+  PROTOWIKI_ARTICLE_WIKI_HOST,
+  PROTOWIKI_IN_ARTICLE_WIKI_LINK,
+} from '@/composables/useInArticleWikiLinks'
 
 import type { ArticleFlag } from './lens'
-import { fetchSummary, type Summary } from './wiki'
+import { articleUrl } from './wiki'
 import './lens-sheet.css'
 
-const props = defineProps<{ flag: ArticleFlag }>()
+const props = defineProps<{
+  /** The highlight that opened the sheet — shown as context on the first page only. */
+  flag: ArticleFlag
+  /** The article currently shown (top of the sheet's history). */
+  title: string
+}>()
+const emit = defineEmits<{ navigate: [title: string] }>()
 
-const summary = ref<Summary | null>(null)
-const error = ref(false)
+const isRoot = computed(() => props.title === props.flag.title)
 
-watchEffect(async () => {
-  summary.value = null
-  error.value = false
-  try {
-    summary.value = await fetchSummary(props.flag.title)
-  } catch {
-    error.value = true
-  }
+provide(
+  PROTOWIKI_ARTICLE_WIKI_HOST,
+  computed(() => 'en.wikipedia.org'),
+)
+provide(PROTOWIKI_IN_ARTICLE_WIKI_LINK, {
+  navigate(title) {
+    const t = title?.trim()
+    if (t) emit('navigate', t)
+  },
+  resolveUrl: (title) => (title ? articleUrl(title) : null),
 })
 
-function openArticle() {
-  if (summary.value) window.open(summary.value.url, '_blank', 'noopener')
+/** Anything the wiki-link handler didn't claim (external links, files) opens in a new tab. */
+function onClick(e: MouseEvent) {
+  if (e.defaultPrevented) return
+  const a = (e.target as Element).closest('a[href]') as HTMLAnchorElement | null
+  if (!a || a.getAttribute('href')?.startsWith('#')) return
+  e.preventDefault()
+  window.open(a.href, '_blank', 'noopener')
 }
 </script>
 
 <template>
-  <div class="byoc-lens">
-    <p class="byoc-lens__kicker">
-      <CdxIcon :icon="cdxIconLogoWikipedia" size="small" />
-      <small>{{
-        flag.match === 'passage' ? 'Related idea on Wikipedia' : 'Wikipedia article'
-      }}</small>
-    </p>
-
-    <blockquote v-if="flag.match === 'passage'" class="byoc-lens__passage">
-      “{{ flag.phrase }}”
-    </blockquote>
-
-    <CdxProgressBar v-if="!summary && !error" inline aria-label="Loading article" />
-    <p v-else-if="error"><small>Couldn’t load this article.</small></p>
-
-    <template v-else-if="summary">
-      <img
-        v-if="summary.thumbnail"
-        class="byoc-lens__thumb"
-        :src="summary.thumbnail.source"
-        alt=""
-        :width="summary.thumbnail.width"
-        :height="summary.thumbnail.height"
-      />
-      <h3 class="byoc-lens__title">{{ summary.title }}</h3>
-      <p v-if="summary.description" class="byoc-lens__desc">
-        <small>{{ summary.description }}</small>
+  <div class="byoc-lens byoc-article" @click="onClick">
+    <template v-if="isRoot">
+      <p class="byoc-lens__kicker">
+        <CdxIcon :icon="cdxIconLogoWikipedia" size="small" />
+        <small>{{
+          flag.match === 'passage' ? 'Related idea on Wikipedia' : 'Wikipedia article'
+        }}</small>
       </p>
-      <p>{{ summary.extract }}</p>
-      <CdxButton action="progressive" weight="primary" class="byoc-lens__cta" @click="openArticle">
-        Read on Wikipedia
-        <CdxIcon :icon="cdxIconLinkExternal" />
-      </CdxButton>
+      <blockquote v-if="flag.match === 'passage'" class="byoc-lens__passage">
+        “{{ flag.phrase }}”
+      </blockquote>
     </template>
+
+    <ArticleLive :key="title" app :article="title" />
   </div>
 </template>
 
 <style scoped>
-.byoc-lens__thumb {
-  float: inline-end;
-  width: 96px;
-  height: auto;
-  max-height: 128px;
-  margin: 0 0 var(--spacing-75) var(--spacing-100);
-  object-fit: cover;
-  border-radius: var(--border-radius-base);
+/* No lead image → drop the app's empty 16:9 placeholder; it wastes half the sheet. */
+.byoc-article :deep(.article__lead-image:not(:has(img))) {
+  display: none;
 }
 </style>

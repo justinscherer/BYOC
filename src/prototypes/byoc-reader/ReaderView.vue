@@ -129,40 +129,230 @@ function segmentsFor(i: number, text: string): Segment[] {
   return segs
 }
 
-const imageFlagsByBlock = computed(() => {
-  const out = new Map<number, LensFlag[]>()
-  if (!enabledKinds.value.includes('image')) return out
-  for (const [i, list] of placements.value) {
-    const imgs = list.filter((p) => p.flag.kind === 'image').map((p) => p.flag)
-    if (imgs.length) out.set(i, imgs)
+// — Pagination: the document flows into CSS columns, one column per page —
+//
+// The flow box is exactly one page tall, so overflow spills into further
+// columns to the right; turning a page shifts the flow left by one page
+// width. Page turns are vertical swipes (or wheel / arrow keys) to feel like
+// an e-reader rather than a scrolling web page.
+
+/** Page gutters. The wider end gutter holds the image margin markers. */
+const PAD = { top: 24, bottom: 16, start: 20, end: 44 }
+const SWIPE_THRESHOLD = 50
+const TURN_MS = 280
+
+const pager = ref<HTMLElement | null>(null)
+const pageEl = ref<HTMLElement | null>(null)
+const flow = ref<HTMLElement | null>(null)
+
+const size = ref({ w: 0, h: 0 })
+const pageCount = ref(1)
+const pageIndex = ref(0)
+/** Vertical offset of the live page — follows the finger, then animates. */
+const offsetY = ref(0)
+const animating = ref(false)
+/** Finger down and moving — the page tracks it 1:1, no easing. */
+const dragging = ref(false)
+/** One-frame jump of the live page to the far edge before it slides in. */
+const jumping = ref(false)
+
+const flowStyle = computed(() => {
+  const cw = Math.max(0, size.value.w - PAD.start - PAD.end)
+  return {
+    top: `${PAD.top}px`,
+    left: `${PAD.start}px`,
+    width: `${cw}px`,
+    height: `${Math.max(0, size.value.h - PAD.top - PAD.bottom)}px`,
+    columnWidth: `${cw}px`,
+    columnGap: `${PAD.start + PAD.end}px`,
+    transform: `translateX(${-pageIndex.value * size.value.w}px)`,
   }
-  return out
 })
 
-// — Margin markers for image flags: align to the line the phrase starts on —
-
-const root = ref<HTMLElement | null>(null)
-const markerTop = ref<Record<string, number>>({})
-
-function measureMarkers() {
-  const tops: Record<string, number> = {}
-  root.value?.querySelectorAll<HTMLElement>('[data-image-anchor]').forEach((el) => {
-    tops[el.dataset.imageAnchor!] = el.offsetTop
+function relayout() {
+  const el = pager.value
+  if (!el) return
+  size.value = { w: el.clientWidth, h: el.clientHeight }
+  nextTick(() => {
+    const f = flow.value
+    if (!f || !size.value.w) return
+    const gap = PAD.start + PAD.end
+    pageCount.value = Math.max(1, Math.round((f.scrollWidth + gap) / size.value.w))
+    pageIndex.value = Math.min(pageIndex.value, pageCount.value - 1)
+    nextTick(measureMarkers)
   })
-  markerTop.value = tops
 }
 
-watch([placements, enabledKinds], () => nextTick(measureMarkers), { deep: true })
-onMounted(() => window.addEventListener('resize', measureMarkers))
-onBeforeUnmount(() => window.removeEventListener('resize', measureMarkers))
+// — Image margin markers for the current page —
 
-// — Bottom sheet —
+const markers = ref<{ flag: LensFlag; top: number }[]>([])
+
+function measureMarkers() {
+  const page = pageEl.value
+  if (!page || !enabledKinds.value.includes('image')) {
+    markers.value = []
+    return
+  }
+  const box = page.getBoundingClientRect()
+  const out: { flag: LensFlag; top: number }[] = []
+  page.querySelectorAll<HTMLElement>('.byoc-reader__flow [data-image-anchor]').forEach((el) => {
+    const r = el.getClientRects()[0]
+    if (!r || r.left < box.left || r.left >= box.left + size.value.w) return
+    const flag = liveFlags.value.find((f) => f.id === el.dataset.imageAnchor)
+    if (flag) out.push({ flag, top: r.top - box.top + (r.height - 22) / 2 })
+  })
+  markers.value = out
+}
+
+watch([placements, enabledKinds], () => nextTick(relayout), { deep: true })
+
+let resizeObserver: ResizeObserver | null = null
+onMounted(() => {
+  resizeObserver = new ResizeObserver(relayout)
+  if (pager.value) resizeObserver.observe(pager.value)
+  document.fonts?.ready.then(relayout)
+  window.addEventListener('keydown', onKey)
+})
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
+  window.removeEventListener('keydown', onKey)
+})
+
+// — Page turns —
+
+/**
+ * Animate to the next/previous page. The outgoing page is a static clone that
+ * slides off while the live page (already showing the new column) slides in
+ * from the opposite edge.
+ */
+function turn(dir: 1 | -1) {
+  const next = pageIndex.value + dir
+  if (animating.value || next < 0 || next >= pageCount.value) {
+    offsetY.value = 0
+    return
+  }
+  const page = pageEl.value!
+  const h = size.value.h
+  const ghost = page.cloneNode(true) as HTMLElement
+  ghost.classList.add('byoc-reader__page--ghost')
+  ghost.style.transition = 'none'
+  ghost.style.transform = `translateY(${offsetY.value}px)`
+  page.parentElement!.appendChild(ghost)
+
+  animating.value = true
+  jumping.value = true
+  pageIndex.value = next
+  offsetY.value = dir * h
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      jumping.value = false
+      ghost.style.transition = `transform ${TURN_MS}ms ease, opacity ${TURN_MS}ms ease`
+      ghost.style.transform = `translateY(${-dir * h}px)`
+      ghost.style.opacity = '0.4'
+      offsetY.value = 0
+    })
+  })
+  window.setTimeout(() => {
+    ghost.remove()
+    animating.value = false
+    measureMarkers()
+  }, TURN_MS + 40)
+}
+
+let dragStartY: number | null = null
+let dragged = false
+
+function onPointerDown(e: PointerEvent) {
+  if (animating.value || e.button !== 0) return
+  dragStartY = e.clientY
+  dragged = false
+}
+
+function onPointerMove(e: PointerEvent) {
+  if (dragStartY === null) return
+  const dy = e.clientY - dragStartY
+  if (!dragged && Math.abs(dy) > 8) {
+    dragged = true
+    dragging.value = true
+    pager.value?.setPointerCapture(e.pointerId)
+  }
+  if (!dragged) return
+  // Resist past the first and last page.
+  const atEdge =
+    (dy > 0 && pageIndex.value === 0) || (dy < 0 && pageIndex.value === pageCount.value - 1)
+  offsetY.value = atEdge ? dy * 0.2 : dy
+}
+
+function onPointerUp() {
+  if (dragStartY === null) return
+  dragStartY = null
+  dragging.value = false
+  if (!dragged) return
+  const dy = offsetY.value
+  if (dy <= -SWIPE_THRESHOLD) turn(1)
+  else if (dy >= SWIPE_THRESHOLD) turn(-1)
+  else offsetY.value = 0
+}
+
+/** A drag shouldn't also count as a tap on a highlight. */
+function onClickCapture(e: MouseEvent) {
+  if (dragged) {
+    e.stopPropagation()
+    e.preventDefault()
+    dragged = false
+  }
+}
+
+let wheelAccum = 0
+let wheelLock = 0
+function onWheel(e: WheelEvent) {
+  e.preventDefault()
+  if (Date.now() < wheelLock) return
+  wheelAccum += e.deltaY
+  if (Math.abs(wheelAccum) > 40) {
+    turn(wheelAccum > 0 ? 1 : -1)
+    wheelAccum = 0
+    wheelLock = Date.now() + 500
+  }
+}
+
+function onKey(e: KeyboardEvent) {
+  if (active.value) return
+  if (['ArrowDown', 'PageDown', ' '].includes(e.key)) {
+    e.preventDefault()
+    turn(1)
+  } else if (['ArrowUp', 'PageUp'].includes(e.key)) {
+    e.preventDefault()
+    turn(-1)
+  }
+}
+
+// — Bottom sheet; article sheets keep their own link history —
 
 const active = ref<LensFlag | null>(null)
 const sheetLabel = computed(() => (active.value ? LENS_KIND_LABEL[active.value.kind] : ''))
+const articleHistory = ref<string[]>([])
+const sheetExpanded = ref(false)
 
 function open(flag?: LensFlag) {
-  if (flag) active.value = flag
+  if (!flag) return
+  active.value = flag
+  articleHistory.value = flag.kind === 'article' ? [flag.title] : []
+}
+
+function closeSheet() {
+  active.value = null
+  articleHistory.value = []
+}
+
+function sheetNavigate(title: string) {
+  articleHistory.value = [...articleHistory.value, title]
+  sheetExpanded.value = true
+}
+
+function sheetBack() {
+  articleHistory.value = articleHistory.value.slice(0, -1)
 }
 
 const figureFailed = ref(false)
@@ -177,94 +367,142 @@ const figureFailed = ref(false)
       <small class="byoc-reader__bar-source">{{ doc.source }}</small>
     </header>
 
-    <article ref="root" class="byoc-reader__doc">
-      <p class="byoc-reader__kicker">
-        <small>{{ doc.source }} · Newsletter</small>
-      </p>
-      <h1 class="byoc-reader__title">{{ doc.title }}</h1>
-      <p class="byoc-reader__subtitle">{{ doc.subtitle }}</p>
-      <p class="byoc-reader__byline">
-        <small>{{ doc.author }} · {{ doc.date }}</small>
-      </p>
-
-      <section class="byoc-reader__lens" aria-label="Wikipedia lens">
-        <p class="byoc-reader__lens-label">
-          <small v-if="resolved">Wikipedia lens · tap a highlight</small>
-          <small v-else>Reading through Wikipedia…</small>
-        </p>
-        <div class="byoc-reader__toggles">
-          <button
-            v-for="b in toggleButtons"
-            :key="b.value"
-            type="button"
-            class="byoc-chip"
-            :class="`byoc-chip--${b.value}`"
-            :aria-pressed="enabledKinds.includes(b.value)"
-            @click="toggleKind(b.value)"
-          >
-            <span class="byoc-chip__swatch" aria-hidden="true" />
-            {{ b.label }}
-          </button>
-        </div>
-      </section>
-
-      <template v-for="(block, i) in doc.blocks" :key="i">
-        <h2 v-if="block.type === 'h2'">{{ block.text }}</h2>
-
-        <figure
-          v-else-if="block.type === 'figure'"
-          v-show="!figureFailed"
-          class="byoc-reader__figure"
-        >
-          <img :src="block.src" :alt="block.alt" loading="lazy" @error="figureFailed = true" />
-        </figure>
-
-        <div v-else class="byoc-reader__block">
-          <p :class="{ 'byoc-reader__p--emphasis': block.emphasis }">
-            <template v-for="(seg, k) in segmentsFor(i, block.text)" :key="k">
-              <span
-                v-if="seg.target"
-                class="byoc-hl"
-                :class="{
-                  'byoc-hl--fact': seg.fact,
-                  'byoc-hl--article': seg.mark === 'article',
-                  'byoc-hl--image': seg.mark === 'image',
-                  'is-start': seg.edgeStart,
-                  'is-end': seg.edgeEnd,
-                }"
-                :data-image-anchor="seg.imageAnchor"
-                role="button"
-                tabindex="0"
-                @click="open(seg.target)"
-                @keydown.enter.prevent="open(seg.target)"
-                >{{ seg.text }}</span
-              >
-              <template v-else>{{ seg.text }}</template>
-            </template>
+    <div
+      ref="pager"
+      class="byoc-reader__pager"
+      @pointerdown="onPointerDown"
+      @pointermove="onPointerMove"
+      @pointerup="onPointerUp"
+      @pointercancel="onPointerUp"
+      @click.capture="onClickCapture"
+      @wheel="onWheel"
+    >
+      <div
+        ref="pageEl"
+        class="byoc-reader__page"
+        :class="{ 'is-settling': !dragging && !jumping }"
+        :style="{ transform: `translateY(${offsetY}px)` }"
+      >
+        <article ref="flow" class="byoc-reader__flow" :style="flowStyle">
+          <p class="byoc-reader__kicker">
+            <small>{{ doc.source }} · Newsletter</small>
+          </p>
+          <h1 class="byoc-reader__title">{{ doc.title }}</h1>
+          <p class="byoc-reader__subtitle">{{ doc.subtitle }}</p>
+          <p class="byoc-reader__byline">
+            <small>{{ doc.author }} · {{ doc.date }}</small>
           </p>
 
-          <button
-            v-for="flag in imageFlagsByBlock.get(i) ?? []"
-            :key="flag.id"
-            type="button"
-            class="byoc-reader__marker"
-            :style="{ top: `${markerTop[flag.id] ?? 0}px` }"
-            :aria-label="`Images: ${flag.phrase}`"
-            @click="open(flag)"
-          >
-            <CdxIcon :icon="cdxIconImage" size="small" />
-          </button>
-        </div>
-      </template>
+          <section class="byoc-reader__lens" aria-label="Wikipedia lens">
+            <p class="byoc-reader__lens-label">
+              <small v-if="resolved">Wikipedia lens · tap a highlight</small>
+              <small v-else>Reading through Wikipedia…</small>
+            </p>
+            <div class="byoc-reader__toggles">
+              <button
+                v-for="b in toggleButtons"
+                :key="b.value"
+                type="button"
+                class="byoc-chip"
+                :class="`byoc-chip--${b.value}`"
+                :aria-pressed="enabledKinds.includes(b.value)"
+                @click="toggleKind(b.value)"
+              >
+                <span class="byoc-chip__swatch" aria-hidden="true" />
+                {{ b.label }}
+              </button>
+            </div>
+          </section>
 
-      <p class="byoc-reader__end">
-        <small>Originally published on {{ doc.source }}.</small>
-      </p>
-    </article>
+          <template v-for="(block, i) in doc.blocks" :key="i">
+            <h2 v-if="block.type === 'h2'">{{ block.text }}</h2>
 
-    <BottomSheet :open="!!active" :label="sheetLabel" @close="active = null">
+            <figure
+              v-else-if="block.type === 'figure'"
+              v-show="!figureFailed"
+              class="byoc-reader__figure"
+            >
+              <img
+                :src="block.src"
+                :alt="block.alt"
+                width="1536"
+                height="1024"
+                @load="relayout"
+                @error="figureFailed = true"
+              />
+            </figure>
+
+            <p v-else :class="{ 'byoc-reader__p--emphasis': block.emphasis }">
+              <template v-for="(seg, k) in segmentsFor(i, block.text)" :key="k">
+                <span
+                  v-if="seg.target"
+                  class="byoc-hl"
+                  :class="{
+                    'byoc-hl--fact': seg.fact,
+                    'byoc-hl--article': seg.mark === 'article',
+                    'byoc-hl--image': seg.mark === 'image',
+                    'is-start': seg.edgeStart,
+                    'is-end': seg.edgeEnd,
+                  }"
+                  :data-image-anchor="seg.imageAnchor"
+                  role="button"
+                  tabindex="0"
+                  @click="open(seg.target)"
+                  @keydown.enter.prevent="open(seg.target)"
+                  >{{ seg.text }}</span
+                >
+                <template v-else>{{ seg.text }}</template>
+              </template>
+            </p>
+          </template>
+
+          <p class="byoc-reader__end">
+            <small>Originally published on {{ doc.source }}.</small>
+          </p>
+        </article>
+
+        <button
+          v-for="m in markers"
+          :key="m.flag.id"
+          type="button"
+          class="byoc-reader__marker"
+          :style="{ top: `${m.top}px` }"
+          :aria-label="`Images: ${m.flag.phrase}`"
+          @click="open(m.flag)"
+        >
+          <CdxIcon :icon="cdxIconImage" size="small" />
+        </button>
+      </div>
+    </div>
+
+    <footer class="byoc-reader__footer">
+      <div class="byoc-reader__progress" aria-hidden="true">
+        <span :style="{ width: `${((pageIndex + 1) / pageCount) * 100}%` }" />
+      </div>
+      <small>
+        <template v-if="pageIndex === 0">Swipe up to turn the page · </template>
+        {{ pageIndex + 1 }} of {{ pageCount }}
+      </small>
+    </footer>
+
+    <BottomSheet
+      v-model:expanded="sheetExpanded"
+      :open="!!active"
+      :label="sheetLabel"
+      :expandable="active?.kind === 'article'"
+      :back="articleHistory.length > 1"
+      :scroll-key="articleHistory.length"
+      @close="closeSheet"
+      @back="sheetBack"
+    >
       <template v-if="active">
-        <ArticleLens v-if="active.kind === 'article'" :key="active.id" :flag="active" />
+        <ArticleLens
+          v-if="active.kind === 'article'"
+          :key="active.id"
+          :flag="active"
+          :title="articleHistory[articleHistory.length - 1]"
+          @navigate="sheetNavigate"
+        />
         <ImageLens v-else-if="active.kind === 'image'" :key="active.id" :flag="active" />
         <FactLens v-else :key="active.id" :flag="active" />
       </template>
@@ -274,19 +512,20 @@ const figureFailed = ref(false)
 
 <style scoped>
 .byoc-reader {
-  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
   background-color: var(--background-color-base);
 }
 
 .byoc-reader__bar {
-  position: sticky;
-  top: 0;
-  z-index: 10;
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: var(--spacing-25);
   padding: var(--spacing-25) var(--spacing-50);
-  background-color: var(--background-color-base);
   border-bottom: var(--border-width-base) solid var(--border-color-muted);
 }
 
@@ -294,9 +533,38 @@ const figureFailed = ref(false)
   color: var(--color-subtle);
 }
 
-.byoc-reader__doc {
-  /* Wider end padding leaves a margin column for image markers. */
-  padding: var(--spacing-150) 44px var(--spacing-200) var(--spacing-150);
+.byoc-reader__pager {
+  position: relative;
+  flex: 1 1 auto;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.byoc-reader__page {
+  position: absolute;
+  inset: 0;
+  background-color: var(--background-color-base);
+}
+
+.byoc-reader__page.is-settling {
+  transition: transform 280ms ease;
+}
+
+.byoc-reader__page--ghost {
+  pointer-events: none;
+  z-index: 1;
+}
+
+.byoc-reader__flow {
+  position: absolute;
+  box-sizing: border-box;
+  column-fill: auto;
+}
+
+.byoc-reader__flow > :first-child {
+  margin-top: 0;
 }
 
 .byoc-reader__kicker,
@@ -319,6 +587,7 @@ const figureFailed = ref(false)
   margin: var(--spacing-150) 0 var(--spacing-100);
   padding: var(--spacing-75) 0;
   border-block: var(--border-width-base) solid var(--border-color-muted);
+  break-inside: avoid;
 }
 
 .byoc-reader__lens-label {
@@ -379,19 +648,22 @@ const figureFailed = ref(false)
   background-color: transparent;
 }
 
+.byoc-reader__flow h2 {
+  break-after: avoid;
+}
+
 .byoc-reader__figure {
   margin: var(--spacing-150) 0;
+  break-inside: avoid;
 }
 
 .byoc-reader__figure img {
   display: block;
   width: 100%;
   height: auto;
+  max-height: 40vh;
+  object-fit: cover;
   border-radius: var(--border-radius-base);
-}
-
-.byoc-reader__block {
-  position: relative;
 }
 
 .byoc-reader__p--emphasis {
@@ -400,7 +672,7 @@ const figureFailed = ref(false)
 
 .byoc-reader__marker {
   position: absolute;
-  inset-inline-end: -36px;
+  inset-inline-end: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -421,6 +693,31 @@ const figureFailed = ref(false)
 .byoc-reader__end {
   margin-top: var(--spacing-200);
   color: var(--color-subtle);
+}
+
+.byoc-reader__footer {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-50);
+  padding: 0 var(--spacing-150) var(--spacing-75);
+  color: var(--color-subtle);
+}
+
+.byoc-reader__progress {
+  align-self: stretch;
+  height: 2px;
+  background-color: var(--background-color-interactive);
+  border-radius: var(--border-radius-pill);
+}
+
+.byoc-reader__progress span {
+  display: block;
+  height: 100%;
+  background-color: var(--background-color-progressive);
+  border-radius: inherit;
+  transition: width var(--transition-duration-medium) ease;
 }
 
 /* — Lens highlights — */
